@@ -6,72 +6,92 @@ LOG_MODULE_REGISTER(race_condition_demo, LOG_LEVEL_INF);
 
 #define STACK_SIZE 1024
 #define THREAD_PRIORITY 7
-#define ITERACOES_POR_THREAD 10
+#define NUM_OPERACOES 10
+#define VALOR_OPERACAO 10
 
-/* RECURSO COMPARTILHADO (Variável Global) */
-static volatile int contador_compartilhado = 0;
+/* RECURSO COMPARTILHADO (Estoque de Produtos) */
+static volatile int estoque_disponivel = 100;
 
-/* Função executada concorrentemente pelas Threads */
-void thread_trabalhadora(void *p1, void *p2, void *p3)
+/* =========================================================================
+ * THREAD 1: Execução de Reposição de Estoque (Adiciona itens)
+ * ========================================================================= */
+void thread_reposicao_estoque(void *p1, void *p2, void *p3)
 {
-    int thread_id = (int)(intptr_t)p1;
-
-    for (int i = 0; i < ITERACOES_POR_THREAD; i++) {
+    for (int i = 0; i < NUM_OPERACOES; i++) {
         
-        /* --- INÍCIO DA SEÇÃO CRÍTICA (DESPROTEGIDA) --- */
+        /* 1. Leitura do estado atual */
+        int temp = estoque_disponivel;
+        LOG_INF("[THREAD REPOSICAO] Leu estoque atual = %d", temp);
 
-        /* 1. LEITURA: A thread lê o valor atual da variável global */
-        int valor_local = contador_compartilhado;
-        LOG_INF("[Thread %d] LEU contador = %d", thread_id, valor_local);
-
-        /* 2. ATRASO ARTIFICIAL (Janela de Vulnerabilidade):
-         * k_msleep faz a thread atual entrar em estado BLOCKED/SLEEPING.
-         * O escalonador do Zephyr é forçado a trocar de contexto e dar 
-         * execução para a outra thread ANTES que esta escreva a atualização.
-         */
+        /* 2. Janela de Vulnerabilidade (Preempção do Zephyr) */
         k_msleep(1);
 
-        /* 3. MODIFICAÇÃO */
-        valor_local = valor_local + 1;
+        /* 3. Processamento e Escrita */
+        temp += VALOR_OPERACAO;
+        estoque_disponivel = temp;
+        LOG_INF("--> [THREAD REPOSICAO] Inseriu %d itens. Novo estoque = %d", 
+                VALOR_OPERACAO, estoque_disponivel);
 
-        /* 4. ESCRITA: Sobrescreve a memória com o valor incrementado */
-        contador_compartilhado = valor_local;
-        LOG_INF("--> [Thread %d] ESCREVEU contador = %d", thread_id, contador_compartilhado);
-
-        /* --- FIM DA SEÇÃO CRÍTICA --- */
-
-        k_msleep(5); /* Pausa fora da seção crítica */
+        k_msleep(5);
     }
 }
 
-/* Criação de 2 Threads concorrentes no Zephyr com a mesma prioridade */
-K_THREAD_DEFINE(thread_A, STACK_SIZE, thread_trabalhadora, (void *)1, NULL, NULL, THREAD_PRIORITY, 0, 0);
-K_THREAD_DEFINE(thread_B, STACK_SIZE, thread_trabalhadora, (void *)2, NULL, NULL, THREAD_PRIORITY, 0, 0);
+/* =========================================================================
+ * THREAD 2: Execução de Venda / Abate de Estoque (Remove itens)
+ * ========================================================================= */
+void thread_venda_estoque(void *p1, void *p2, void *p3)
+{
+    for (int i = 0; i < NUM_OPERACOES; i++) {
+        
+        /* 1. Leitura do estado atual */
+        int temp = estoque_disponivel;
+        LOG_INF("[THREAD VENDAS]    Leu estoque atual = %d", temp);
+
+        /* 2. Janela de Vulnerabilidade (Preempção do Zephyr) */
+        k_msleep(1);
+
+        /* 3. Processamento e Escrita */
+        temp -= VALOR_OPERACAO;
+        estoque_disponivel = temp;
+        LOG_INF("--> [THREAD VENDAS]    Vendeu %d itens. Novo estoque = %d", 
+                VALOR_OPERACAO, estoque_disponivel);
+
+        k_msleep(5);
+    }
+}
+
+/* Definição de duas Threads com funções de entrada distintas */
+K_THREAD_DEFINE(t_reposicao, STACK_SIZE, thread_reposicao_estoque, NULL, NULL, NULL, THREAD_PRIORITY, 0, 0);
+K_THREAD_DEFINE(t_vendas, STACK_SIZE, thread_venda_estoque, NULL, NULL, NULL, THREAD_PRIORITY, 0, 0);
 
 int main(void)
 {
+    int estoque_inicial = estoque_disponivel;
+
     LOG_INF("==================================================");
-    LOG_INF("  FRDM-KL25Z: DEMONSTRACAO DE RACE CONDITION      ");
+    LOG_INF("  FRDM-KL25Z: RACE CONDITION COM THREADS DISTINTAS");
     LOG_INF("==================================================");
-    LOG_INF("2 Threads incrementando o recurso %d vezes cada.", ITERACOES_POR_THREAD);
-    LOG_INF("Valor Final Esperado: %d", ITERACOES_POR_THREAD * 2);
+    LOG_INF("Estoque Inicial          : %d unidades", estoque_inicial);
+    LOG_INF("Operações da Reposicao   : %d x (+%d)", NUM_OPERACOES, VALOR_OPERACAO);
+    LOG_INF("Operações de Vendas      : %d x (-%d)", NUM_OPERACOES, VALOR_OPERACAO);
+    LOG_INF("Estoque Esperado ao Final: %d unidades", estoque_inicial);
     LOG_INF("--------------------------------------------------");
 
-    /* Aguarda tempo suficiente para as threads concluírem o ciclo */
+    /* Aguarda o término de todas as operações */
     k_msleep(3000);
 
-    /* Exibição dos resultados e evidência da perda de atualização */
+    /* Exibição da divergência no saldo final */
     LOG_INF("==================================================");
-    LOG_INF("RESULTADO FINAL DA EXECUCAO:");
-    LOG_INF("Valor ESPERADO : %d", ITERACOES_POR_THREAD * 2);
-    LOG_INF("Valor REAL     : %d", contador_compartilhado);
+    LOG_INF("RESULTADO FINAL:");
+    LOG_INF("Estoque ESPERADO : %d", estoque_inicial);
+    LOG_INF("Estoque REAL     : %d", estoque_disponivel);
     
-    int perdas = (ITERACOES_POR_THREAD * 2) - contador_compartilhado;
-    if (perdas > 0) {
-        LOG_INF("STATUS         : RACE CONDITION DETECTADA!");
-        LOG_INF("Perda de %d incremento(s) devido a leituras inconsistentes.", perdas);
+    if (estoque_disponivel != estoque_inicial) {
+        LOG_INF("STATUS           : RACE CONDITION DETECTADA!");
+        LOG_INF("Diferença de %d unidades por sobrescrita de memória.", 
+                estoque_disponivel - estoque_inicial);
     } else {
-        LOG_INF("STATUS         : Nenhuma perda detectada (Execucao atipica).");
+        LOG_INF("STATUS           : Execucao sem perdas aparentes (Raro sem Mutex).");
     }
     LOG_INF("==================================================");
 
